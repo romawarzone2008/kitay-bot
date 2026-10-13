@@ -14,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo,
 )
 from aiohttp import web
 from dotenv import load_dotenv
@@ -23,11 +24,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-# === Ссылка на канал, которая будет добавляться под каждый пост ===
 CHANNEL_LINK = "https://t.me/kitay_gorod_podsluchka"
 CHANNEL_NAME = "Подслушано КГ"
 
 DB = "bot.db"
+
+# Буферы для альбомов (мультифото)
+_media_buffers = {}
+_media_tasks = {}
 
 
 # ---------- БАЗА ДАННЫХ ----------
@@ -48,7 +52,8 @@ def db_init():
         moderated_at TEXT,
         published_at TEXT,
         message_id_in_channel INTEGER,
-        admin_msg_id INTEGER
+        admin_msg_id INTEGER,
+        extra_msg_ids TEXT
     );
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -58,6 +63,10 @@ def db_init():
         last_submit_at TEXT
     );
     """)
+    # Миграция: добавить extra_msg_ids, если её нет
+    cols = [r[1] for r in con.execute("PRAGMA table_info(submissions)").fetchall()]
+    if "extra_msg_ids" not in cols:
+        con.execute("ALTER TABLE submissions ADD COLUMN extra_msg_ids TEXT")
     con.commit()
     con.close()
 
@@ -89,7 +98,6 @@ class Form(StatesGroup):
     waiting_post = State()
 
 
-# ---------- РОУТЕРЫ ----------
 user_router = Router()
 admin_router = Router()
 
@@ -119,7 +127,7 @@ async def cb_rules(c: CallbackQuery):
         "— без порно и жести\n"
         "— без личных данных (адреса, телефоны)\n"
         "— без спама и рекламы\n"
-        "— антифлуд: 1 пост в 15 минут"
+        "— антифлуд: 1 пост в минуту"
     )
     await c.answer()
 
@@ -152,6 +160,7 @@ async def cmd_status(m: Message):
         return await m.answer("❌ Заявка с таким кодом не найдена.")
     status_map = {
         "pending": "🕐 На модерации",
+        "processing": "🕐 В обработке",
         "approved": "✅ Опубликовано",
         "rejected": f"❌ Отклонено: {row['reject_reason'] or 'без причины'}",
         "scheduled": "🕐 Отложено на публикацию",
@@ -185,11 +194,19 @@ async def cmd_delete(m: Message, bot: Bot):
         con.close()
         return await m.answer(f"❌ Пост {code} не был опубликован в канале (статус: {row['status']}).")
 
+    all_ids = [msg_id]
     try:
-        await bot.delete_message(CHANNEL_ID, msg_id)
+        extra = json.loads(row["extra_msg_ids"] or "[]")
+        if isinstance(extra, list):
+            all_ids.extend(extra)
+    except Exception:
+        pass
+
+    try:
+        await bot.delete_messages(CHANNEL_ID, all_ids)
     except Exception as e:
         con.close()
-        return await m.answer(f"❌ Не удалось удалить сообщение из канала: {e}")
+        return await m.answer(f"❌ Не удалось удалить: {e}")
 
     uid = row["user_id"]
     con.execute("UPDATE submissions SET status='deleted', reject_reason='удалено' WHERE id=?", (row["id"],))
@@ -206,12 +223,41 @@ async def cmd_delete(m: Message, bot: Bot):
 # ---------- ПРИЁМ ПОСТОВ ----------
 @user_router.message(Form.waiting_post, F.text | F.photo | F.video | F.animation)
 async def receive_post(m: Message, state: FSMContext):
+    # Если это часть альбома — буферизуем
+    if m.media_group_id:
+        mgid = m.media_group_id
+        _media_buffers.setdefault(mgid, []).append(m)
+        old_task = _media_tasks.pop(mgid, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _media_tasks[mgid] = asyncio.create_task(_process_media_group(mgid, state, m.bot))
+        return
+
+    # Одиночное сообщение — обрабатываем сразу
+    await _create_submission([m], state, m.bot)
+
+
+async def _process_media_group(mgid: str, state: FSMContext, bot: Bot):
+    try:
+        await asyncio.sleep(1.2)
+    except asyncio.CancelledError:
+        return
+    messages = _media_buffers.pop(mgid, [])
+    _media_tasks.pop(mgid, None)
+    if not messages:
+        return
+    await _create_submission(messages, state, bot)
+
+
+async def _create_submission(messages, state: FSMContext, bot: Bot):
+    first = messages[0]
     con = db()
-    u = con.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
+    u = con.execute("SELECT * FROM users WHERE user_id=?", (first.from_user.id,)).fetchone()
 
     if u and u["banned"]:
         con.close()
-        return await m.answer("🚫 Ты забанен и не можешь отправлять посты.")
+        await state.clear()
+        return await first.answer("🚫 Ты забанен и не можешь отправлять посты.")
 
     now = datetime.utcnow()
     if u and u["last_submit_at"]:
@@ -219,26 +265,34 @@ async def receive_post(m: Message, state: FSMContext):
         if (now - last).total_seconds() < 60:
             wait_sec = int(60 - (now - last).total_seconds()) + 1
             con.close()
-            return await m.answer(f"⏳ Подожди ещё {wait_sec} сек. перед следующим постом.")
+            await state.clear()
+            return await first.answer(f"⏳ Подожди ещё {wait_sec} сек. перед следующим постом.")
 
-    text = m.caption or m.text or ""
+    media_items = []
+    for msg in messages:
+        if msg.photo:
+            media_items.append(["photo", msg.photo[-1].file_id])
+        elif msg.video:
+            media_items.append(["video", msg.video.file_id])
+        elif msg.animation:
+            media_items.append(["animation", msg.animation.file_id])
 
-    if m.photo:
-        typ, file_id = "photo", m.photo[-1].file_id
-    elif m.video:
-        typ, file_id = "video", m.video.file_id
-    elif m.animation:
-        typ, file_id = "animation", m.animation.file_id
+    text = first.caption or first.text or ""
+
+    if len(media_items) > 1:
+        typ = "media_group"
+    elif len(media_items) == 1:
+        typ = media_items[0][0]
     else:
-        typ, file_id = "text", None
+        typ = "text"
 
     code = gen_code()
-    media_ids = json.dumps([file_id]) if file_id else "[]"
+    media_ids = json.dumps(media_items)
 
     con.execute(
         "INSERT INTO submissions (code,user_id,username,type,content,media_ids,created_at) "
         "VALUES (?,?,?,?,?,?,?)",
-        (code, m.from_user.id, m.from_user.username, typ, text, media_ids, now.isoformat())
+        (code, first.from_user.id, first.from_user.username, typ, text, media_ids, now.isoformat())
     )
     con.execute(
         """INSERT INTO users (user_id, username, submissions_count, last_submit_at)
@@ -247,16 +301,16 @@ async def receive_post(m: Message, state: FSMContext):
              submissions_count = submissions_count + 1,
              last_submit_at = excluded.last_submit_at,
              username = excluded.username""",
-        (m.from_user.id, m.from_user.username, now.isoformat())
+        (first.from_user.id, first.from_user.username, now.isoformat())
     )
     con.commit()
     sub_id = con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     con.close()
 
-    await send_to_admin(m.bot, sub_id, code, m, typ, file_id, text)
+    await send_to_admin(bot, sub_id, code, first, typ, media_items, text)
 
     await state.clear()
-    await m.answer(
+    await first.answer(
         f"✅ Пост принят на модерацию.\n"
         f"Твой код: <code>{code}</code>\n"
         f"Проверить статус: /status {code}",
@@ -264,7 +318,7 @@ async def receive_post(m: Message, state: FSMContext):
     )
 
 
-async def send_to_admin(bot: Bot, sub_id, code, m, typ, file_id, text):
+async def send_to_admin(bot: Bot, sub_id, code, m, typ, media_items, text):
     header = (
         f"🆕 Заявка <code>{code}</code>\n"
         f"👤 Автор: @{m.from_user.username or 'anon'} (id {m.from_user.id})\n"
@@ -284,12 +338,27 @@ async def send_to_admin(bot: Bot, sub_id, code, m, typ, file_id, text):
     ])
 
     try:
-        if typ == "photo":
-            sent = await bot.send_photo(ADMIN_CHAT_ID, file_id, caption=header, reply_markup=kb)
+        if typ == "media_group" and len(media_items) > 1:
+            album = []
+            for i, pair in enumerate(media_items):
+                mtype, fid = pair[0], pair[1]
+                caption = header if i == 0 else None
+                if mtype == "photo":
+                    album.append(InputMediaPhoto(media=fid, caption=caption))
+                elif mtype == "video":
+                    album.append(InputMediaVideo(media=fid, caption=caption))
+            await bot.send_media_group(ADMIN_CHAT_ID, album)
+            sent = await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"⬆️ Заявка <code>{code}</code> — выбери действие:",
+                reply_markup=kb
+            )
+        elif typ == "photo":
+            sent = await bot.send_photo(ADMIN_CHAT_ID, media_items[0][1], caption=header, reply_markup=kb)
         elif typ == "video":
-            sent = await bot.send_video(ADMIN_CHAT_ID, file_id, caption=header, reply_markup=kb)
+            sent = await bot.send_video(ADMIN_CHAT_ID, media_items[0][1], caption=header, reply_markup=kb)
         elif typ == "animation":
-            sent = await bot.send_animation(ADMIN_CHAT_ID, file_id, caption=header, reply_markup=kb)
+            sent = await bot.send_animation(ADMIN_CHAT_ID, media_items[0][1], caption=header, reply_markup=kb)
         else:
             sent = await bot.send_message(ADMIN_CHAT_ID, header, reply_markup=kb)
     except Exception as e:
@@ -302,17 +371,25 @@ async def send_to_admin(bot: Bot, sub_id, code, m, typ, file_id, text):
     con.close()
 
 
-# ---------- ДЕЙСТВИЯ АДМИНА (кнопки) ----------
+# ---------- ДЕЙСТВИЯ АДМИНА ----------
 @admin_router.callback_query(F.data.startswith("ap:"))
 async def cb_approve(c: CallbackQuery, bot: Bot):
     sub_id = int(c.data.split(":")[1])
     con = db()
-    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
-    if not row or row["status"] != "pending":
+
+    # Атомарно: pending → processing (защита от двойного клика)
+    upd = con.execute(
+        "UPDATE submissions SET status='processing' WHERE id=? AND status='pending'",
+        (sub_id,)
+    )
+    con.commit()
+    if upd.rowcount == 0:
         con.close()
         return await c.answer("Уже обработано", show_alert=True)
 
-    media_ids = json.loads(row["media_ids"] or "[]")
+    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+
+    media_items = json.loads(row["media_ids"] or "[]")
     text = row["content"] or ""
 
     code_hash = "#" + row["code"].replace("-", "_")
@@ -320,25 +397,43 @@ async def cb_approve(c: CallbackQuery, bot: Bot):
     footer = f"\n\n🔎 {code_hash}\n{channel_link}"
     full_text = (text + footer).strip() if text else footer.strip()
 
-    published = None
+    msg_ids = []
     try:
-        if row["type"] == "photo":
-            published = await bot.send_photo(CHANNEL_ID, media_ids[0], caption=full_text)
+        if row["type"] == "media_group" and len(media_items) > 1:
+            album = []
+            for i, pair in enumerate(media_items):
+                mtype, fid = pair[0], pair[1]
+                caption = full_text if i == 0 else None
+                if mtype == "photo":
+                    album.append(InputMediaPhoto(media=fid, caption=caption, parse_mode="HTML"))
+                elif mtype == "video":
+                    album.append(InputMediaVideo(media=fid, caption=caption, parse_mode="HTML"))
+            published = await bot.send_media_group(CHANNEL_ID, album)
+            msg_ids = [msg.message_id for msg in published]
+        elif row["type"] == "photo":
+            msg = await bot.send_photo(CHANNEL_ID, media_items[0][1], caption=full_text)
+            msg_ids = [msg.message_id]
         elif row["type"] == "video":
-            published = await bot.send_video(CHANNEL_ID, media_ids[0], caption=full_text)
+            msg = await bot.send_video(CHANNEL_ID, media_items[0][1], caption=full_text)
+            msg_ids = [msg.message_id]
         elif row["type"] == "animation":
-            published = await bot.send_animation(CHANNEL_ID, media_ids[0], caption=full_text)
+            msg = await bot.send_animation(CHANNEL_ID, media_items[0][1], caption=full_text)
+            msg_ids = [msg.message_id]
         else:
-            published = await bot.send_message(CHANNEL_ID, full_text)
+            msg = await bot.send_message(CHANNEL_ID, full_text)
+            msg_ids = [msg.message_id]
     except Exception as e:
+        # Откатываем статус, чтобы можно было попробовать ещё раз
+        con.execute("UPDATE submissions SET status='pending' WHERE id=?", (sub_id,))
+        con.commit()
         con.close()
         return await c.answer(f"Ошибка публикации: {e}", show_alert=True)
 
     now = datetime.utcnow().isoformat()
     con.execute(
         "UPDATE submissions SET status='approved', moderated_at=?, published_at=?, "
-        "message_id_in_channel=? WHERE id=?",
-        (now, now, published.message_id, sub_id)
+        "message_id_in_channel=?, extra_msg_ids=? WHERE id=?",
+        (now, now, msg_ids[0], json.dumps(msg_ids[1:]), sub_id)
     )
     con.commit()
     uid = row["user_id"]
@@ -441,7 +536,7 @@ async def cb_cancel(c: CallbackQuery):
     await c.answer("Отменено")
 
 
-# ---------- СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА (на уровне файла) ----------
+# ---------- СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА ----------
 db_init()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -451,7 +546,6 @@ dp.include_router(user_router)
 
 # ---------- ВЕБХУК ----------
 async def handle_webhook(request):
-    """Обрабатывает вебхуки от Telegram."""
     try:
         update_data = await request.json()
         from aiogram.types import Update
@@ -463,7 +557,6 @@ async def handle_webhook(request):
 
 
 async def on_startup(app):
-    """Устанавливает вебхук при запуске."""
     base_url = app['webhook_base_url']
     webhook_url = f"{base_url}/webhook"
     await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -471,7 +564,6 @@ async def on_startup(app):
 
 
 async def on_shutdown(app):
-    """Удаляет вебхук при выключении."""
     await bot.delete_webhook()
     print("Вебхук удалён")
 
