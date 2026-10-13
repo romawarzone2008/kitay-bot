@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaVideo,
+    InputMediaPhoto, InputMediaVideo, PreCheckoutQuery, LabeledPrice,
 )
 from aiohttp import web
 from dotenv import load_dotenv
@@ -27,9 +27,18 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 CHANNEL_LINK = "https://t.me/kitay_gorod_podsluchka"
 CHANNEL_NAME = "Подслушано КГ"
 
+STARS_PRICE = 300  # цена удаления в звёздах
+
+MANUAL_PAYMENT_INFO = (
+    "💳 <b>Реквизиты для оплаты:</b>\n\n"
+    "Карта: <code>2202 2089 6392 9477</code>\n"
+    "Сумма: <b>300 ₽</b>\n\n"
+    "После перевода отправьте квитанцию об оплате в Бота."
+)
+
 DB = "bot.db"
 
-# Буферы для альбомов (мультифото)
+# Буферы для альбомов
 _media_buffers = {}
 _media_tasks = {}
 
@@ -63,7 +72,6 @@ def db_init():
         last_submit_at TEXT
     );
     """)
-    # Миграция: добавить extra_msg_ids, если её нет
     cols = [r[1] for r in con.execute("PRAGMA table_info(submissions)").fetchall()]
     if "extra_msg_ids" not in cols:
         con.execute("ALTER TABLE submissions ADD COLUMN extra_msg_ids TEXT")
@@ -96,6 +104,9 @@ async def is_admin(bot: Bot, user_id: int) -> bool:
 # ---------- FSM ----------
 class Form(StatesGroup):
     waiting_post = State()
+    waiting_delete_code = State()
+    waiting_manual_code = State()
+    waiting_manual_receipt = State()
 
 
 user_router = Router()
@@ -105,6 +116,8 @@ admin_router = Router()
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Отправить пост", callback_data="send")],
+        [InlineKeyboardButton(text="🗑 Удалить пост (⭐)", callback_data="paid_delete")],
+        [InlineKeyboardButton(text="💳 Удалить пост (ручная)", callback_data="paid_delete_manual")],
         [InlineKeyboardButton(text="🔍 Проверить статус", callback_data="status")],
         [InlineKeyboardButton(text="📜 Правила", callback_data="rules")],
     ])
@@ -169,7 +182,7 @@ async def cmd_status(m: Message):
     await m.answer(f"Код {code}: {status_map.get(row['status'], row['status'])}")
 
 
-# ---------- КОМАНДА /delete (только для админов) ----------
+# ---------- КОМАНДА /delete (админ) ----------
 @admin_router.message(Command("delete"))
 async def cmd_delete(m: Message, bot: Bot):
     if not await is_admin(bot, m.from_user.id):
@@ -192,7 +205,7 @@ async def cmd_delete(m: Message, bot: Bot):
     msg_id = row["message_id_in_channel"]
     if not msg_id:
         con.close()
-        return await m.answer(f"❌ Пост {code} не был опубликован в канале (статус: {row['status']}).")
+        return await m.answer(f"❌ Пост {code} не был опубликован (статус: {row['status']}).")
 
     all_ids = [msg_id]
     try:
@@ -209,7 +222,7 @@ async def cmd_delete(m: Message, bot: Bot):
         return await m.answer(f"❌ Не удалось удалить: {e}")
 
     uid = row["user_id"]
-    con.execute("UPDATE submissions SET status='deleted', reject_reason='удалено' WHERE id=?", (row["id"],))
+    con.execute("UPDATE submissions SET status='deleted', reject_reason='удалено админом' WHERE id=?", (row["id"],))
     con.commit()
     con.close()
 
@@ -220,10 +233,213 @@ async def cmd_delete(m: Message, bot: Bot):
         pass
 
 
+# ---------- ОПЛАТА STARS ----------
+@user_router.callback_query(F.data == "paid_delete")
+async def cb_paid_delete(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Введи код поста, который хочешь удалить (например, KG-ABCD1):")
+    await state.set_state(Form.waiting_delete_code)
+    await c.answer()
+
+
+@user_router.message(Form.waiting_delete_code)
+async def process_delete_code(m: Message, state: FSMContext):
+    code = (m.text or "").strip().upper()
+    if not code.startswith("KG-"):
+        code = "KG-" + code
+
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE code=?", (code,)).fetchone()
+    con.close()
+
+    if not row:
+        return await m.answer("❌ Пост с таким кодом не найден.")
+    if row["status"] != "approved":
+        return await m.answer("❌ Этот пост ещё не опубликован или уже удалён.")
+    if row["user_id"] != m.from_user.id:
+        return await m.answer("🚫 Это не твой пост. Удалить может только автор.")
+
+    await m.answer(
+        f"Пост <code>{code}</code> найден.\n"
+        f"Стоимость удаления: <b>{STARS_PRICE} ⭐</b>\n\n"
+        f"Оплати, чтобы удалить пост из канала."
+    )
+
+    await m.bot.send_invoice(
+        chat_id=m.chat.id,
+        title="Удаление поста",
+        description=f"Удаление поста {code} из канала",
+        payload=f"delete_{code}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Удаление", amount=STARS_PRICE)],
+    )
+    await state.clear()
+
+
+@user_router.pre_checkout_query()
+async def process_pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@user_router.message(F.successful_payment)
+async def process_successful_payment(m: Message, bot: Bot):
+    payload = m.successful_payment.invoice_payload
+    if not payload.startswith("delete_"):
+        return await m.answer("✅ Оплата получена, но пост не распознан.")
+
+    code = payload.replace("delete_", "")
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE code=?", (code,)).fetchone()
+    if not row or row["status"] != "approved":
+        con.close()
+        return await m.answer("❌ Пост уже удалён или не найден.")
+
+    msg_ids = [row["message_id_in_channel"]]
+    try:
+        extra = json.loads(row["extra_msg_ids"] or "[]")
+        if isinstance(extra, list):
+            msg_ids.extend(extra)
+    except Exception:
+        pass
+
+    try:
+        await bot.delete_messages(CHANNEL_ID, msg_ids)
+    except Exception as e:
+        con.close()
+        return await m.answer(f"❌ Не удалось удалить пост: {e}")
+
+    con.execute("UPDATE submissions SET status='deleted', reject_reason='удалено (Stars)' WHERE id=?", (row["id"],))
+    con.commit()
+    con.close()
+
+    await m.answer(f"✅ Пост <code>{code}</code> удалён из канала. Спасибо за оплату!")
+
+
+# ---------- РУЧНАЯ ОПЛАТА ----------
+@user_router.callback_query(F.data == "paid_delete_manual")
+async def cb_paid_delete_manual(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Введи код поста для удаления (например, KG-ABCD1):")
+    await state.set_state(Form.waiting_manual_code)
+    await c.answer()
+
+
+@user_router.message(Form.waiting_manual_code)
+async def process_manual_code(m: Message, state: FSMContext):
+    code = (m.text or "").strip().upper()
+    if not code.startswith("KG-"):
+        code = "KG-" + code
+
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE code=?", (code,)).fetchone()
+    con.close()
+
+    if not row:
+        return await m.answer("❌ Пост с таким кодом не найден.")
+    if row["status"] != "approved":
+        return await m.answer("❌ Этот пост ещё не опубликован или уже удалён.")
+    if row["user_id"] != m.from_user.id:
+        return await m.answer("🚫 Это не твой пост.")
+
+    await m.answer(f"Пост <code>{code}</code> найден.\n\n{MANUAL_PAYMENT_INFO}")
+    await state.update_data(delete_code=code)
+    await state.set_state(Form.waiting_manual_receipt)
+
+
+@user_router.message(Form.waiting_manual_receipt, F.photo)
+async def process_manual_receipt(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    code = data.get("delete_code")
+    if not code:
+        await state.clear()
+        return await m.answer("❌ Что-то пошло не так, начни заново.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"manual_ok:{code}:{m.from_user.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"manual_no:{m.from_user.id}"),
+        ]
+    ])
+
+    await bot.send_photo(
+        ADMIN_CHAT_ID,
+        m.photo[-1].file_id,
+        caption=(
+            f"💳 <b>Ручная оплата — чек</b>\n"
+            f"Код поста: <code>{code}</code>\n"
+            f"Автор: @{m.from_user.username or 'anon'} (id {m.from_user.id})"
+        ),
+        reply_markup=kb
+    )
+
+    await m.answer("✅ Чек отправлен на проверку. Ожидай подтверждения.")
+    await state.clear()
+
+
+@user_router.message(Form.waiting_manual_receipt)
+async def process_manual_receipt_wrong(m: Message):
+    await m.answer("📷 Отправь, пожалуйста, <b>скриншот чека</b> (как фото).")
+
+
+@admin_router.callback_query(F.data.startswith("manual_ok:"))
+async def cb_manual_ok(c: CallbackQuery, bot: Bot):
+    _, code, uid = c.data.split(":")
+    uid = int(uid)
+
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE code=?", (code,)).fetchone()
+    if not row or row["status"] != "approved":
+        con.close()
+        return await c.answer("Пост уже удалён или не найден.", show_alert=True)
+
+    msg_ids = [row["message_id_in_channel"]]
+    try:
+        extra = json.loads(row["extra_msg_ids"] or "[]")
+        if isinstance(extra, list):
+            msg_ids.extend(extra)
+    except Exception:
+        pass
+
+    try:
+        await bot.delete_messages(CHANNEL_ID, msg_ids)
+    except Exception as e:
+        con.close()
+        return await c.answer(f"Ошибка удаления: {e}", show_alert=True)
+
+    con.execute("UPDATE submissions SET status='deleted', reject_reason='удалено (ручная оплата)' WHERE id=?", (row["id"],))
+    con.commit()
+    con.close()
+
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await c.message.answer(f"✅ Оплата подтверждена. Пост {code} удалён.")
+    try:
+        await bot.send_message(uid, f"✅ Оплата подтверждена. Пост <code>{code}</code> удалён из канала.")
+    except Exception:
+        pass
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.startswith("manual_no:"))
+async def cb_manual_no(c: CallbackQuery, bot: Bot):
+    _, uid = c.data.split(":")
+    uid = int(uid)
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await c.message.answer("❌ Оплата отклонена.")
+    try:
+        await bot.send_message(uid, "❌ Чек не подтверждён. Свяжись с админом.")
+    except Exception:
+        pass
+    await c.answer()
+
+
 # ---------- ПРИЁМ ПОСТОВ ----------
 @user_router.message(Form.waiting_post, F.text | F.photo | F.video | F.animation)
 async def receive_post(m: Message, state: FSMContext):
-    # Если это часть альбома — буферизуем
     if m.media_group_id:
         mgid = m.media_group_id
         _media_buffers.setdefault(mgid, []).append(m)
@@ -233,7 +449,6 @@ async def receive_post(m: Message, state: FSMContext):
         _media_tasks[mgid] = asyncio.create_task(_process_media_group(mgid, state, m.bot))
         return
 
-    # Одиночное сообщение — обрабатываем сразу
     await _create_submission([m], state, m.bot)
 
 
@@ -371,39 +586,40 @@ async def send_to_admin(bot: Bot, sub_id, code, m, typ, media_items, text):
     con.close()
 
 
-# ---------- ДЕЙСТВИЯ АДМИНА ----------
+# ---------- ДЕЙСТВИЯ АДМИНА (кнопки) ----------
 @admin_router.callback_query(F.data.startswith("ap:"))
 async def cb_approve(c: CallbackQuery, bot: Bot):
-    # Мгновенно отвечаем Telegram'у, чтобы он не слал retry
     await c.answer()
 
     sub_id = int(c.data.split(":")[1])
     con = db()
 
-    # Атомарно: pending → processing
     upd = con.execute(
         "UPDATE submissions SET status='processing' WHERE id=? AND status='pending'",
         (sub_id,)
     )
     con.commit()
     if upd.rowcount == 0:
-        # Либо уже обработано, либо записи нет — тихо выходим, без алерта
         row = con.execute("SELECT status FROM submissions WHERE id=?", (sub_id,)).fetchone()
         con.close()
         if row:
             await c.message.answer(f"ℹ️ Заявка уже в статусе: {row['status']}")
         else:
-            await c.message.answer("ℹ️ Заявка не найдена (возможно, была удалена после перезапуска сервера).")
+            await c.message.answer("ℹ️ Заявка не найдена (возможно, база обнулилась при перезапуске).")
         return
 
     row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
     media_items = json.loads(row["media_ids"] or "[]")
     text = row["content"] or ""
 
-    code_hash = "#" + row["code"].replace("-", "_")
+    code_block = (
+        f"━━━━━━━━━━━━━━\n"
+        f"🔎 Код поста: <code>{row['code']}</code>\n"
+        f"━━━━━━━━━━━━━━"
+    )
     channel_link = f'📢 <a href="{CHANNEL_LINK}">{CHANNEL_NAME}</a>'
-    footer = f"\n\n🔎 {code_hash}\n{channel_link}"
-    full_text = (text + footer).strip() if text else footer.strip()
+    footer = f"\n\n{code_block}\n{channel_link}"
+    full_text = (text + footer).strip() if text else f"{code_block}\n{channel_link}"
 
     msg_ids = []
     try:
@@ -457,6 +673,8 @@ async def cb_approve(c: CallbackQuery, bot: Bot):
         await bot.send_message(uid, f"✅ Твой пост <code>{code}</code> опубликован!")
     except Exception:
         pass
+
+
 @admin_router.callback_query(F.data.startswith("rj:"))
 async def cb_reject(c: CallbackQuery):
     sub_id = int(c.data.split(":")[1])
@@ -489,7 +707,10 @@ async def cb_reject_reason(c: CallbackQuery, bot: Bot):
     uid = row["user_id"]
     code = row["code"]
     con.close()
-    await c.message.edit_text(f"❌ Отклонено: {code} ({reason})")
+    try:
+        await c.message.edit_text(f"❌ Отклонено: {code} ({reason})")
+    except Exception:
+        await c.message.answer(f"❌ Отклонено: {code} ({reason})")
     try:
         await bot.send_message(uid, f"❌ Твой пост <code>{code}</code> отклонён. Причина: {reason}")
     except Exception:
@@ -514,7 +735,10 @@ async def cb_ban(c: CallbackQuery, bot: Bot):
     uid = row["user_id"]
     code = row["code"]
     con.close()
-    await c.message.edit_reply_markup(reply_markup=None)
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await c.message.answer(f"🚫 Забанен автор {code}")
     try:
         await bot.send_message(uid, "🚫 Ты забанен.")
@@ -533,18 +757,24 @@ async def cb_delete(c: CallbackQuery):
     )
     con.commit()
     con.close()
-    await c.message.edit_reply_markup(reply_markup=None)
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await c.message.answer("🗑 Удалено")
     await c.answer()
 
 
 @admin_router.callback_query(F.data == "cancel")
 async def cb_cancel(c: CallbackQuery):
-    await c.message.edit_reply_markup(reply_markup=None)
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await c.answer("Отменено")
 
 
-# ---------- СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА ----------
+# ---------- СОЗДАНИЕ БОТА ----------
 db_init()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -560,7 +790,7 @@ async def handle_webhook(request):
         update = Update.model_validate(update_data, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
-        print(f"Ошибка при обработке вебхука: {e}")
+        print(f"Ошибка вебхука: {e}")
     return web.Response()
 
 
