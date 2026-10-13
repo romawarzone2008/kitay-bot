@@ -374,21 +374,29 @@ async def send_to_admin(bot: Bot, sub_id, code, m, typ, media_items, text):
 # ---------- ДЕЙСТВИЯ АДМИНА ----------
 @admin_router.callback_query(F.data.startswith("ap:"))
 async def cb_approve(c: CallbackQuery, bot: Bot):
+    # Мгновенно отвечаем Telegram'у, чтобы он не слал retry
+    await c.answer()
+
     sub_id = int(c.data.split(":")[1])
     con = db()
 
-    # Атомарно: pending → processing (защита от двойного клика)
+    # Атомарно: pending → processing
     upd = con.execute(
         "UPDATE submissions SET status='processing' WHERE id=? AND status='pending'",
         (sub_id,)
     )
     con.commit()
     if upd.rowcount == 0:
+        # Либо уже обработано, либо записи нет — тихо выходим, без алерта
+        row = con.execute("SELECT status FROM submissions WHERE id=?", (sub_id,)).fetchone()
         con.close()
-        return await c.answer("Уже обработано", show_alert=True)
+        if row:
+            await c.message.answer(f"ℹ️ Заявка уже в статусе: {row['status']}")
+        else:
+            await c.message.answer("ℹ️ Заявка не найдена (возможно, была удалена после перезапуска сервера).")
+        return
 
     row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
-
     media_items = json.loads(row["media_ids"] or "[]")
     text = row["content"] or ""
 
@@ -423,11 +431,11 @@ async def cb_approve(c: CallbackQuery, bot: Bot):
             msg = await bot.send_message(CHANNEL_ID, full_text)
             msg_ids = [msg.message_id]
     except Exception as e:
-        # Откатываем статус, чтобы можно было попробовать ещё раз
         con.execute("UPDATE submissions SET status='pending' WHERE id=?", (sub_id,))
         con.commit()
         con.close()
-        return await c.answer(f"Ошибка публикации: {e}", show_alert=True)
+        await c.message.answer(f"❌ Ошибка публикации: {e}")
+        return
 
     now = datetime.utcnow().isoformat()
     con.execute(
@@ -440,15 +448,15 @@ async def cb_approve(c: CallbackQuery, bot: Bot):
     code = row["code"]
     con.close()
 
-    await c.message.edit_reply_markup(reply_markup=None)
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await c.message.answer(f"✅ Опубликовано: {code}")
     try:
         await bot.send_message(uid, f"✅ Твой пост <code>{code}</code> опубликован!")
     except Exception:
         pass
-    await c.answer("Опубликовано")
-
-
 @admin_router.callback_query(F.data.startswith("rj:"))
 async def cb_reject(c: CallbackQuery):
     sub_id = int(c.data.split(":")[1])
