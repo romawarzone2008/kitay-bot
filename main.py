@@ -27,7 +27,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 CHANNEL_LINK = "https://t.me/kitay_gorod_podsluchka"
 CHANNEL_NAME = "Подслушано КГ"
 
-STARS_PRICE = 300  # цена удаления в звёздах
+STARS_PRICE = 300
 
 MANUAL_PAYMENT_INFO = (
     "💳 <b>Реквизиты для оплаты:</b>\n\n"
@@ -38,7 +38,6 @@ MANUAL_PAYMENT_INFO = (
 
 DB = "bot.db"
 
-# Буферы для альбомов
 _media_buffers = {}
 _media_tasks = {}
 
@@ -107,6 +106,8 @@ class Form(StatesGroup):
     waiting_delete_code = State()
     waiting_manual_code = State()
     waiting_manual_receipt = State()
+    waiting_custom_reject = State()
+    waiting_edit = State()
 
 
 user_router = Router()
@@ -123,6 +124,21 @@ def main_menu():
     ])
 
 
+def admin_kb(sub_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"ap:{sub_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rj:{sub_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"ed:{sub_id}"),
+            InlineKeyboardButton(text="🚫 Бан", callback_data=f"bn:{sub_id}"),
+        ],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"dl:{sub_id}")],
+    ])
+
+
+# ---------- ПОЛЬЗОВАТЕЛЬ ----------
 @user_router.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
@@ -182,7 +198,7 @@ async def cmd_status(m: Message):
     await m.answer(f"Код {code}: {status_map.get(row['status'], row['status'])}")
 
 
-# ---------- КОМАНДА /delete (админ) ----------
+# ---------- АДМИН: /delete ----------
 @admin_router.message(Command("delete"))
 async def cmd_delete(m: Message, bot: Bot):
     if not await is_admin(bot, m.from_user.id):
@@ -231,6 +247,12 @@ async def cmd_delete(m: Message, bot: Bot):
         await bot.send_message(uid, f"🗑 Твой пост <code>{code}</code> удалён из канала.")
     except Exception:
         pass
+
+
+@admin_router.message(Command("cancel_edit"))
+async def cmd_cancel_edit(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("✏️ Редактирование отменено.")
 
 
 # ---------- ОПЛАТА STARS ----------
@@ -522,7 +544,12 @@ async def _create_submission(messages, state: FSMContext, bot: Bot):
     sub_id = con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     con.close()
 
-    await send_to_admin(bot, sub_id, code, first, typ, media_items, text)
+    await send_review_to_admin(
+        bot, sub_id, code,
+        first.from_user.username, first.from_user.id,
+        typ, media_items, text,
+        status_line="🆕 Новая заявка"
+    )
 
     await state.clear()
     await first.answer(
@@ -533,24 +560,15 @@ async def _create_submission(messages, state: FSMContext, bot: Bot):
     )
 
 
-async def send_to_admin(bot: Bot, sub_id, code, m, typ, media_items, text):
+async def send_review_to_admin(bot: Bot, sub_id, code, username, user_id, typ, media_items, text, status_line="🆕 Новая заявка"):
     header = (
-        f"🆕 Заявка <code>{code}</code>\n"
-        f"👤 Автор: @{m.from_user.username or 'anon'} (id {m.from_user.id})\n"
+        f"{status_line} <code>{code}</code>\n"
+        f"👤 Автор: @{username or 'anon'} (id {user_id})\n"
         f"🕐 {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC\n"
         f"📊 Тип: {typ}\n"
         f"---\n{text or '(без текста)'}"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"ap:{sub_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rj:{sub_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="🚫 Бан", callback_data=f"bn:{sub_id}"),
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"dl:{sub_id}"),
-        ],
-    ])
+    kb = admin_kb(sub_id)
 
     try:
         if typ == "media_group" and len(media_items) > 1:
@@ -584,6 +602,113 @@ async def send_to_admin(bot: Bot, sub_id, code, m, typ, media_items, text):
     con.execute("UPDATE submissions SET admin_msg_id=? WHERE id=?", (sent.message_id, sub_id))
     con.commit()
     con.close()
+
+
+# ---------- РЕДАКТИРОВАНИЕ ЗАЯВКИ ----------
+@admin_router.callback_query(F.data.startswith("ed:"))
+async def cb_edit(c: CallbackQuery, state: FSMContext):
+    sub_id = int(c.data.split(":")[1])
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+    con.close()
+    if not row:
+        return await c.answer("Заявка не найдена", show_alert=True)
+    if row["status"] != "pending":
+        return await c.answer(f"Нельзя редактировать. Статус: {row['status']}", show_alert=True)
+
+    await state.update_data(edit_sub_id=sub_id)
+    await state.set_state(Form.waiting_edit)
+    await c.message.answer(
+        f"✏️ <b>Редактирование заявки</b> <code>{row['code']}</code>\n\n"
+        f"Отправь одним сообщением:\n"
+        f"— новый <b>текст</b> (заменит подпись),\n"
+        f"— новое <b>фото/видео</b> (заменит медиа),\n"
+        f"— или фото с новой подписью (заменит и то, и другое).\n\n"
+        f"⚠️ Мультифото в редактировании не поддерживается — только одно.\n"
+        f"Отмена — /cancel_edit"
+    )
+    await c.answer()
+
+
+@admin_router.message(Form.waiting_edit)
+async def cb_edit_save(m: Message, state: FSMContext, bot: Bot):
+    if not await is_admin(bot, m.from_user.id):
+        await state.clear()
+        return await m.answer("🚫 Только для админов.")
+
+    data = await state.get_data()
+    sub_id = data.get("edit_sub_id")
+    if not sub_id:
+        await state.clear()
+        return await m.answer("❌ Что-то пошло не так, начни заново.")
+
+    new_text = None
+    if m.caption:
+        new_text = m.caption
+    elif m.text:
+        new_text = m.text
+
+    new_media = None
+    if m.photo:
+        new_media = ["photo", m.photo[-1].file_id]
+    elif m.video:
+        new_media = ["video", m.video.file_id]
+    elif m.animation:
+        new_media = ["animation", m.animation.file_id]
+
+    if new_text is None and new_media is None:
+        return await m.answer("❌ Отправь текст или фото/видео.")
+
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+    if not row:
+        con.close()
+        await state.clear()
+        return await m.answer("❌ Заявка не найдена (возможно, база обнулилась).")
+    if row["status"] != "pending":
+        con.close()
+        await state.clear()
+        return await m.answer(f"❌ Нельзя редактировать. Статус: {row['status']}.")
+
+    old_admin_msg_id = row["admin_msg_id"]
+
+    if new_media is not None:
+        upd_media = json.dumps([new_media])
+        upd_type = new_media[0]
+        if new_text is not None:
+            con.execute(
+                "UPDATE submissions SET media_ids=?, type=?, content=? WHERE id=?",
+                (upd_media, upd_type, new_text, sub_id)
+            )
+        else:
+            con.execute(
+                "UPDATE submissions SET media_ids=?, type=? WHERE id=?",
+                (upd_media, upd_type, sub_id)
+            )
+    else:
+        con.execute("UPDATE submissions SET content=? WHERE id=?", (new_text, sub_id))
+
+    con.commit()
+    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+    con.close()
+
+    # Снимаем кнопки со старого сообщения
+    if old_admin_msg_id:
+        try:
+            await bot.edit_message_reply_markup(ADMIN_CHAT_ID, old_admin_msg_id, reply_markup=None)
+        except Exception:
+            pass
+
+    # Отправляем обновлённую заявку в админ-чат
+    await send_review_to_admin(
+        bot, sub_id, row["code"],
+        row["username"], row["user_id"],
+        row["type"], json.loads(row["media_ids"] or "[]"), row["content"] or "",
+        status_line="🔄 Обновлённая заявка"
+    )
+
+    await state.clear()
+    await m.answer(f"✅ Заявка <code>{row['code']}</code> обновлена. Смотри новое сообщение выше.")
 
 
 # ---------- ДЕЙСТВИЯ АДМИНА (кнопки) ----------
@@ -676,7 +801,7 @@ async def cb_approve(c: CallbackQuery, bot: Bot):
 
 
 @admin_router.callback_query(F.data.startswith("rj:"))
-async def cb_reject(c: CallbackQuery):
+async def cb_reject(c: CallbackQuery, state: FSMContext):
     sub_id = int(c.data.split(":")[1])
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Мат/оскорбления", callback_data=f"rr:{sub_id}:мат")],
@@ -684,10 +809,71 @@ async def cb_reject(c: CallbackQuery):
         [InlineKeyboardButton(text="Жесть/кровь", callback_data=f"rr:{sub_id}:жесть")],
         [InlineKeyboardButton(text="Спам/реклама", callback_data=f"rr:{sub_id}:спам")],
         [InlineKeyboardButton(text="Не по теме", callback_data=f"rr:{sub_id}:не по теме")],
+        [InlineKeyboardButton(text="✏️ Своя причина", callback_data=f"rrc:{sub_id}")],
         [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
     ])
     await c.message.answer("Причина отклонения:", reply_markup=kb)
     await c.answer()
+
+
+@admin_router.callback_query(F.data.startswith("rrc:"))
+async def cb_reject_custom(c: CallbackQuery, state: FSMContext):
+    sub_id = int(c.data.split(":")[1])
+    await state.update_data(custom_reject_sub_id=sub_id)
+    await state.set_state(Form.waiting_custom_reject)
+    await c.message.answer(
+        "✏️ Напиши свою причину отказа одним сообщением.\n"
+        "Оно уйдёт автору поста как причина."
+    )
+    await c.answer()
+
+
+@admin_router.message(Form.waiting_custom_reject)
+async def cb_reject_custom_save(m: Message, state: FSMContext, bot: Bot):
+    if not await is_admin(bot, m.from_user.id):
+        await state.clear()
+        return await m.answer("🚫 Только для админов.")
+
+    data = await state.get_data()
+    sub_id = data.get("custom_reject_sub_id")
+    if not sub_id:
+        await state.clear()
+        return await m.answer("❌ Что-то пошло не так. Начни заново.")
+
+    reason = (m.text or "").strip()
+    if not reason:
+        return await m.answer("❌ Причина не может быть пустой. Напиши текст.")
+    if len(reason) > 200:
+        return await m.answer("❌ Слишком длинно (максимум 200 символов).")
+
+    con = db()
+    row = con.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+    if not row:
+        con.close()
+        await state.clear()
+        return await m.answer("❌ Заявка не найдена (возможно, база обнулилась).")
+
+    con.execute(
+        "UPDATE submissions SET status='rejected', reject_reason=?, moderated_at=? WHERE id=?",
+        (reason, datetime.utcnow().isoformat(), sub_id)
+    )
+    con.commit()
+    uid = row["user_id"]
+    code = row["code"]
+    con.close()
+
+    await state.clear()
+
+    await m.answer(f"❌ Отклонено: {code}\nПричина: {reason}")
+
+    try:
+        await bot.send_message(
+            uid,
+            f"❌ Твой пост <code>{code}</code> отклонён.\n"
+            f"Причина: {reason}"
+        )
+    except Exception:
+        pass
 
 
 @admin_router.callback_query(F.data.startswith("rr:"))
